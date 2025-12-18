@@ -3,8 +3,10 @@ version: '3.8'
 services:
   # 单容器双服务模式 (推荐)
   warp2api:
+    build: .
     image: warp2api
     container_name: warp2api
+    user: "${UID:-1000}:${GID:-1000}"
     ports:
       #- "8000:8000"  # Protobuf 桥接服务器
       - "48010:8010"  # 多格式 API 服务器

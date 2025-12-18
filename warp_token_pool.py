@@ -27,6 +27,7 @@ from warp_token_manager import WarpTokenService
 
 class TokenStatus(Enum):
     """Token 状态"""
+
     VALID = "valid"
     EXPIRED = "expired"
     RATE_LIMITED = "rate_limited"
@@ -36,6 +37,7 @@ class TokenStatus(Enum):
 @dataclass
 class TokenInfo:
     """Token 信息"""
+
     token: str
     created_at: float
     last_used: float
@@ -45,6 +47,7 @@ class TokenInfo:
     def is_expired(self, buffer_minutes: int = 5) -> bool:
         """检查 token 是否过期"""
         from warp2protobuf.core.auth import is_token_expired
+
         return is_token_expired(self.token, buffer_minutes)
 
     def age_hours(self) -> float:
@@ -57,13 +60,15 @@ class TokenInfo:
 
 
 class WarpTokenPool:
-    """Warp Token 池管理器
+    """Warp Token Pool Manager
 
-    维护多个有效 token，支持快速切换和自动补充。
-    现在集成多账号轮换功能，提高成功率。
+    Maintains multiple valid tokens, supporting fast switching and automatic replenishment.
+    Now integrates multi-account rotation and load balancing.
     """
 
-    def __init__(self, cf_api_token: str = None, cf_account_id: str = None, pool_size: int = 3):
+    def __init__(
+        self, cf_api_token: str = None, cf_account_id: str = None, pool_size: int = None
+    ):
         """
         初始化 Token 池
 
@@ -79,10 +84,11 @@ class WarpTokenPool:
         try:
             # 优先尝试初始化多账号服务
             from warp_token_manager import MultiAccountTokenService
+
             multi_service = MultiAccountTokenService()  # 会从环境变量加载配置
             stats = multi_service.get_stats()
 
-            if stats['total_accounts'] > 1:
+            if stats["total_accounts"] > 1:
                 logger.info(f"使用多账号模式，共有 {stats['total_accounts']} 个账号")
                 self.token_service = multi_service
                 self.use_multi_account = True
@@ -92,10 +98,12 @@ class WarpTokenPool:
                 if not cf_api_token or not cf_account_id:
                     # 从环境变量获取
                     import os
+
                     cf_api_token = cf_api_token or os.getenv("CLOUDFLARE_API_TOKEN")
                     cf_account_id = cf_account_id or os.getenv("CLOUDFLARE_ACCOUNT_ID")
 
                 from warp_token_manager import WarpTokenService
+
                 self.token_service = WarpTokenService(cf_api_token, cf_account_id)
 
         except Exception as e:
@@ -103,14 +111,29 @@ class WarpTokenPool:
             # 回退到单账号模式
             if not cf_api_token or not cf_account_id:
                 import os
+
                 cf_api_token = cf_api_token or os.getenv("CLOUDFLARE_API_TOKEN")
                 cf_account_id = cf_account_id or os.getenv("CLOUDFLARE_ACCOUNT_ID")
 
             from warp_token_manager import WarpTokenService
+
             self.token_service = WarpTokenService(cf_api_token, cf_account_id)
+
+        # Determine pool size: Argument > Env Var > Default (3)
+        if pool_size is None:
+            import os
+
+            try:
+                env_size = int(os.getenv("WARP_POOL_SIZE", "3"))
+                pool_size = max(1, env_size)  # Ensure at least 1
+            except ValueError:
+                pool_size = 3
+
         self.pool_size = pool_size
+
         self.tokens: List[TokenInfo] = []
         self.lock = asyncio.Lock()
+        self._last_used_index = -1  # For Round-Robin load balancing
         self.background_task: Optional[asyncio.Task] = None
         self.is_running = False
 
@@ -119,7 +142,7 @@ class WarpTokenPool:
             "total_requests": 0,
             "successful_switches": 0,
             "tokens_created": 0,
-            "rate_limit_hits": 0
+            "rate_limit_hits": 0,
         }
 
     async def start(self):
@@ -195,6 +218,77 @@ class WarpTokenPool:
             else:
                 raise RuntimeError("无法获取有效的 Warp 访问令牌")
 
+    async def get_load_balanced_token(self) -> str:
+        """
+        Get a valid token using Round-Robin load balancing.
+        This ensures requests are distributed across all available tokens.
+        """
+        async with self.lock:
+            self.stats["total_requests"] += 1
+
+            # 1. Find all valid tokens
+            valid_candidates = [
+                (i, t)
+                for i, t in enumerate(self.tokens)
+                if t.status == TokenStatus.VALID and not t.is_expired()
+            ]
+
+            if not valid_candidates:
+                # No valid tokens, fallback to emergency logic via existing method
+                # We release lock here by calling another async method that might need lock,
+                # but get_valid_token acquires lock internally.
+                # However, since we are ALREADY holding the lock, we must be careful.
+                # Actually, `get_valid_token` acquires lock. We should avoid re-entry if not re-entrant.
+                # To be safe, we'll duplicate the emergency logic here without re-acquiring lock
+                # OR we implement an internal _get_valid_token that assumes lock is held.
+                # For simplicity, let's just do the emergency logic here.
+
+                logger.warning(
+                    "LoadBalancer: No valid tokens in pool, triggering emergency replenishment..."
+                )
+                emergency_token = await self._get_emergency_token()
+                asyncio.create_task(self._ensure_pool_health())
+
+                if emergency_token:
+                    return emergency_token
+                else:
+                    raise RuntimeError(
+                        "Unable to acquire valid Warp access token (Load Balanced)"
+                    )
+
+            # 2. Round-Robin Selection
+            # We want to pick the next valid token after _last_used_index
+
+            # Sort candidates by their original index to ensure consistent order
+            valid_candidates.sort(key=lambda x: x[0])
+
+            # Find the first candidate whose index is > _last_used_index
+            chosen_tuple = None
+            for idx, token in valid_candidates:
+                if idx > self._last_used_index:
+                    chosen_tuple = (idx, token)
+                    break
+
+            # If we reached the end, wrap around to the first candidate
+            if not chosen_tuple:
+                chosen_tuple = valid_candidates[0]
+
+            chosen_index, chosen_token = chosen_tuple
+
+            # Update state
+            self._last_used_index = chosen_index
+            chosen_token.last_used = time.time()
+            chosen_token.use_count += 1
+
+            logger.debug(
+                f"LoadBalancer: Selected token at index {chosen_index} (Usage: {chosen_token.use_count})"
+            )
+
+            # Trigger background replenishment if needed
+            asyncio.create_task(self._ensure_pool_health())
+
+            return chosen_token.token
+
     async def handle_rate_limit(self, failed_token: str) -> Optional[str]:
         """
         处理 429 错误，立即切换到备用 token
@@ -212,7 +306,9 @@ class WarpTokenPool:
             for token_info in self.tokens:
                 if token_info.token == failed_token:
                     token_info.status = TokenStatus.RATE_LIMITED
-                    logger.warning(f"Token 遇到 429，标记为受限: {failed_token[:50]}...")
+                    logger.warning(
+                        f"Token 遇到 429，标记为受限: {failed_token[:50]}..."
+                    )
                     break
 
             # 查找备用 token
@@ -244,14 +340,15 @@ class WarpTokenPool:
 
             return emergency_token
 
-    async def _find_valid_token(self, exclude_token: Optional[str] = None) -> Optional[TokenInfo]:
+    async def _find_valid_token(
+        self, exclude_token: Optional[str] = None
+    ) -> Optional[TokenInfo]:
         """查找有效的 token"""
         for token_info in self.tokens:
             if exclude_token and token_info.token == exclude_token:
                 continue
 
-            if (token_info.status == TokenStatus.VALID and
-                not token_info.is_expired()):
+            if token_info.status == TokenStatus.VALID and not token_info.is_expired():
                 return token_info
 
         return None
@@ -261,7 +358,9 @@ class WarpTokenPool:
         logger.info(f"开始填充 Token 池，目标大小: {self.pool_size}")
 
         tasks = []
-        needed = self.pool_size - len([t for t in self.tokens if t.status == TokenStatus.VALID])
+        needed = self.pool_size - len(
+            [t for t in self.tokens if t.status == TokenStatus.VALID]
+        )
 
         for i in range(needed):
             task = asyncio.create_task(self._create_token_with_retry())
@@ -278,7 +377,7 @@ class WarpTokenPool:
                     created_at=time.time(),
                     last_used=0,
                     use_count=0,
-                    status=TokenStatus.VALID
+                    status=TokenStatus.VALID,
                 )
                 self.tokens.append(token_info)
                 success_count += 1
@@ -296,7 +395,7 @@ class WarpTokenPool:
             except Exception as e:
                 logger.error(f"创建 token 失败 (尝试 {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # 指数退避
+                    await asyncio.sleep(2**attempt)  # 指数退避
 
         return None
 
@@ -311,7 +410,7 @@ class WarpTokenPool:
                     created_at=time.time(),
                     last_used=time.time(),
                     use_count=1,
-                    status=TokenStatus.VALID
+                    status=TokenStatus.VALID,
                 )
                 self.tokens.append(token_info)
                 self.stats["tokens_created"] += 1
@@ -352,7 +451,8 @@ class WarpTokenPool:
 
         # 移除过期或受限的 token
         self.tokens = [
-            t for t in self.tokens
+            t
+            for t in self.tokens
             if (t.status == TokenStatus.VALID and not t.is_expired())
         ]
 
@@ -362,8 +462,13 @@ class WarpTokenPool:
 
     async def _ensure_pool_health(self):
         """确保池的健康状态 - 当有效 token 少于一半时立即补充"""
-        valid_count = len([t for t in self.tokens
-                          if t.status == TokenStatus.VALID and not t.is_expired()])
+        valid_count = len(
+            [
+                t
+                for t in self.tokens
+                if t.status == TokenStatus.VALID and not t.is_expired()
+            ]
+        )
 
         # 计算补充阈值：池大小的一半（向上取整）
         threshold = (self.pool_size + 1) // 2
@@ -371,7 +476,9 @@ class WarpTokenPool:
         # 当有效 token 数量少于或等于阈值时，立即补充到满池
         if valid_count <= threshold:
             needed = self.pool_size - valid_count
-            logger.info(f"Token 池健康度低于 50% (当前: {valid_count}/{self.pool_size})，补充 {needed} 个 token")
+            logger.info(
+                f"Token 池健康度低于 50% (当前: {valid_count}/{self.pool_size})，补充 {needed} 个 token"
+            )
 
             # 异步创建新 token
             for _ in range(needed):
@@ -390,12 +497,14 @@ class WarpTokenPool:
                         created_at=time.time(),
                         last_used=0,
                         use_count=0,
-                        status=TokenStatus.VALID
+                        status=TokenStatus.VALID,
                     )
                     self.tokens.append(token_info)
                     self.stats["tokens_created"] += 1
 
-                    logger.debug(f"后台添加新 token 到池中，当前池大小: {len(self.tokens)}")
+                    logger.debug(
+                        f"后台添加新 token 到池中，当前池大小: {len(self.tokens)}"
+                    )
         except Exception as e:
             logger.error(f"后台创建 token 失败: {e}")
 
@@ -407,8 +516,11 @@ class WarpTokenPool:
             **self.stats,
             "pool_size": len(self.tokens),
             "valid_tokens": len(valid_tokens),
-            "average_token_age": sum(t.age_hours() for t in valid_tokens) / len(valid_tokens) if valid_tokens else 0,
-            "total_token_uses": sum(t.use_count for t in self.tokens)
+            "average_token_age": sum(t.age_hours() for t in valid_tokens)
+            / len(valid_tokens)
+            if valid_tokens
+            else 0,
+            "total_token_uses": sum(t.use_count for t in self.tokens),
         }
 
 
@@ -456,7 +568,7 @@ async def main():
         # 模拟多次请求
         for i in range(5):
             token = await get_pooled_token()
-            print(f"第 {i+1} 次请求，获得 token: {token[:50]}...")
+            print(f"第 {i + 1} 次请求，获得 token: {token[:50]}...")
 
             # 模拟 429 错误
             if i == 2:

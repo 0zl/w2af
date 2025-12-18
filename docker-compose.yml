@@ -11,6 +11,7 @@ services:
       #- "8000:8000"  # Protobuf 桥接服务器
       - "48010:8010"  # 多格式 API 服务器
     environment:
+      - UV_CACHE_DIR=/tmp/.uv_cache
       #- HOST=0.0.0.0
       #- PORT=8010
       #- BRIDGE_BASE_URL=http://localhost:8001

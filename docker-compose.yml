@@ -16,7 +16,7 @@ services:
       #- PORT=8010
       #- BRIDGE_BASE_URL=http://localhost:8001
       # 账号池-only 模式配置（指向外部或同机运行的 pool_service）
-      - POOL_SERVICE_BASE_URL=http://host.docker.internal:8019
+      # - POOL_SERVICE_BASE_URL=http://host.docker.internal:8019
       # - POOL_SERVICE_API_KEY=${POOL_SERVICE_API_KEY}
     volumes:
       - ./logs:/app/logs  # 日志持久化
